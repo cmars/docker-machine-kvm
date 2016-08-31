@@ -3,11 +3,9 @@ package kvm
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"github.com/alexzorin/libvirt-go"
 	"io"
 	"io/ioutil"
 	"os"
@@ -15,6 +13,8 @@ import (
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/alexzorin/libvirt-go"
 
 	"github.com/docker/machine/libmachine/drivers"
 	"github.com/docker/machine/libmachine/log"
@@ -28,8 +28,6 @@ const (
 	connectionString   = "qemu:///system"
 	privateNetworkName = "docker-machines"
 	isoFilename        = "boot2docker.iso"
-	dnsmasqLeases      = "/var/lib/libvirt/dnsmasq/%s.leases"
-	dnsmasqStatus      = "/var/lib/libvirt/dnsmasq/%s.status"
 
 	domainXMLTemplate = `<domain type='kvm'>
   <name>{{.MachineName}}</name> <memory unit='M'>{{.Memory}}</memory>
@@ -537,62 +535,23 @@ func (d *Driver) getMAC() (string, error) {
 	return dom.Devices.Interfaces[1].Mac.Address, nil
 }
 
-func (d *Driver) getIPByMACFromLeaseFile(mac string) (string, error) {
-	leaseFile := fmt.Sprintf(dnsmasqLeases, d.PrivateNetwork)
-	data, err := ioutil.ReadFile(leaseFile)
-	if err != nil {
-		log.Debugf("Failed to retrieve dnsmasq leases from %s", leaseFile)
-		return "", err
-	}
-	for lineNum, line := range strings.Split(string(data), "\n") {
-		if len(line) == 0 {
-			continue
-		}
-		entries := strings.Split(line, " ")
-		if len(entries) < 3 {
-			log.Warnf("Malformed dnsmasq line %d", lineNum+1)
-			return "", errors.New("Malformed dnsmasq file")
-		}
-		if strings.ToLower(entries[1]) == strings.ToLower(mac) {
-			log.Debugf("IP address: %s", entries[2])
-			return entries[2], nil
-		}
-	}
-	return "", nil
-}
-
-func (d *Driver) getIPByMacFromSettings(mac string) (string, error) {
+func (d *Driver) getIPByMACFromAPI(mac string) (string, error) {
 	network, err := d.conn.LookupNetworkByName(d.PrivateNetwork)
 	if err != nil {
-		log.Warnf("Failed to find network: %s", err)
+		log.Errorf("Failed to lookup network %s", d.PrivateNetwork)
 		return "", err
 	}
-	bridge_name, err := network.GetBridgeName()
+	leases, err := network.GetDHCPLeases()
 	if err != nil {
-		log.Warnf("Failed to get network bridge: %s", err)
+		log.Warnf("Failed to retrieve DHCP leases from libvirt: %v", err)
 		return "", err
 	}
-	statusFile := fmt.Sprintf(dnsmasqStatus, bridge_name)
-	data, err := ioutil.ReadFile(statusFile)
-	type Lease struct {
-		Ip_address  string `json:"ip-address"`
-		Mac_address string `json:"mac-address"`
-		// Other unused fields omitted
-	}
-	var s []Lease
-
-	err = json.Unmarshal(data, &s)
-	if err != nil {
-		log.Warnf("Failed to decode dnsmasq lease status: %s", err)
-		return "", err
-	}
-	for _, value := range s {
-		if strings.ToLower(value.Mac_address) == strings.ToLower(mac) {
-			log.Debugf("IP address: %s", value.Ip_address)
-			return value.Ip_address, nil
+	for _, lease := range leases {
+		if strings.ToLower(mac) == strings.ToLower(lease.GetMACAddress()) {
+			return lease.GetIPAddress(), nil
 		}
 	}
-	return "", nil
+	return "", errors.New("failed to match IP for MAC address")
 }
 
 func (d *Driver) GetIP() (string, error) {
@@ -601,16 +560,13 @@ func (d *Driver) GetIP() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	/*
-	 * TODO - Figure out what version of libvirt changed behavior and
-	 *        be smarter about selecting which algorithm to use
-	 */
-	ip, err := d.getIPByMACFromLeaseFile(mac)
-	if ip == "" {
-		ip, err = d.getIPByMacFromSettings(mac)
+	// Prefer lookup via the libvirt API.
+	ip, err := d.getIPByMACFromAPI(mac)
+	if err != nil {
+		log.Debugf("Unable to locate IP address for MAC %s: %v", mac, err)
+		return "", err
 	}
-	log.Debugf("Unable to locate IP address for MAC %s", mac)
-	return ip, err
+	return ip, nil
 }
 
 func (d *Driver) publicSSHKeyPath() string {
